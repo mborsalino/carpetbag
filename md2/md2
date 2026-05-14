@@ -1,0 +1,391 @@
+#!/usr/bin/env python3
+"""md2 — convert Markdown to HTML, mark (Confluence), or PDF.
+
+Single-file CLI with subcommands:
+  md2 html     <input.md>   — themed self-contained HTML (pandoc).
+  md2 mark     <input.md>   — Markdown shaped for kovetskiy/mark.
+  md2 pdf      <input.md>   — themed PDF (pandoc + weasyprint).
+  md2 doctor                — check dependencies for each subcommand.
+
+Per-subcommand dependencies are only checked when that subcommand runs,
+so missing deps for formats you don't use never get in your way.
+"""
+
+import argparse
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+# ---------- Themes (shared by html and pdf) ----------
+
+THEMES = {
+    "sakura": {
+        "css_url": "https://unpkg.com/sakura.css/css/sakura.css",
+        "base_width_rem": 75.6,
+        "color_overrides": "",
+    },
+    "holiday": {
+        "css_url": "https://cdn.jsdelivr.net/npm/holiday.css@0.11.2",
+        "base_width_rem": 48.0,
+        "color_overrides": (
+            "  code, pre, pre code { color: inherit !important; }\n"
+            "  pre { background: #f4f4f4; }\n"
+        ),
+    },
+}
+
+WIDTH_SCALES = {"S": 0.80, "M": 1.00, "L": 1.25}
+
+
+def make_overrides_html(theme_name: str, width: str):
+    theme = THEMES[theme_name]
+    width_value = f"{theme['base_width_rem'] * WIDTH_SCALES[width]:.1f}rem"
+    parts = [
+        "<style>",
+        f"  body {{ max-width: {width_value}; }}",
+        f"  :root {{ --max-body-width: {width_value}; }}",
+    ]
+    if theme["color_overrides"]:
+        parts.append(theme["color_overrides"])
+    parts.append("</style>")
+    return "\n".join(parts), width_value
+
+
+# ---------- Dependency descriptors (used by subcommands + doctor) ----------
+
+DEPS = {
+    "html": [
+        {"type": "cmd", "name": "pandoc", "install": "apt install pandoc / brew install pandoc"},
+    ],
+    "mark": [],
+    "pdf": [
+        {"type": "cmd", "name": "pandoc", "install": "apt install pandoc / brew install pandoc"},
+        {"type": "module", "name": "weasyprint", "install": "pip install weasyprint"},
+    ],
+}
+
+
+def check_dep(d):
+    if d["type"] == "cmd":
+        path = shutil.which(d["name"])
+        if path is None:
+            return False, None
+        try:
+            r = subprocess.run([d["name"], "--version"],
+                               capture_output=True, text=True, timeout=5)
+            version = r.stdout.strip().splitlines()[0] if r.stdout else None
+        except Exception:
+            version = None
+        return True, version
+    if d["type"] == "module":
+        try:
+            mod = __import__(d["name"])
+            return True, getattr(mod, "__version__", None)
+        except ImportError:
+            return False, None
+    return False, None
+
+
+def ensure_deps(subcommand: str):
+    missing = []
+    for d in DEPS.get(subcommand, []):
+        ok, _ = check_dep(d)
+        if not ok:
+            missing.append(d)
+    if missing:
+        lines = [f"Error: missing dependencies for 'md2 {subcommand}':"]
+        for d in missing:
+            lines.append(f"  - {d['name']}  (install: {d['install']})")
+        lines.append("Run 'md2 doctor' for a full report.")
+        sys.exit("\n".join(lines))
+
+
+# ---------- html ----------
+
+def cmd_html(args):
+    ensure_deps("html")
+
+    theme = THEMES[args.theme]
+    overrides_html, width_value = make_overrides_html(args.theme, args.width)
+
+    output = args.out_file or args.input.with_suffix(".html")
+    title = args.input.stem
+
+    with tempfile.NamedTemporaryFile("w", suffix=".html", delete=False) as f:
+        f.write(overrides_html)
+        overrides_path = f.name
+
+    pandoc_args = [
+        "pandoc", str(args.input), "-o", str(output),
+        "--standalone", "--embed-resources",
+        "--css", theme["css_url"],
+        "-H", overrides_path,
+        "--metadata", f"pagetitle={title}",
+    ]
+    if args.number_sections:
+        pandoc_args.append("--number-sections")
+
+    try:
+        subprocess.run(pandoc_args, check=True)
+    finally:
+        Path(overrides_path).unlink(missing_ok=True)
+
+    print(f"Wrote: {output} (theme={args.theme}, width={args.width} -> {width_value})")
+
+
+# ---------- mark ----------
+
+ADMON_MACRO = {
+    "NOTE": "info",
+    "IMPORTANT": "info",
+    "TIP": "tip",
+    "WARNING": "warning",
+    "CAUTION": "note",
+}
+
+ADMON_START_RE = re.compile(r"^>\s*\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\s*(.*)$")
+ADMON_CONT_RE = re.compile(r"^>\s?(.*)$")
+FENCE_RE = re.compile(r"^\s*```")
+H1_RE = re.compile(r"^#\s+")
+
+
+def convert_to_mark(text: str, strip_h1: bool = False) -> str:
+    lines = text.splitlines()
+    out = []
+    i = 0
+    in_fence = False
+    h1_stripped = False
+
+    while i < len(lines):
+        line = lines[i]
+
+        if FENCE_RE.match(line):
+            in_fence = not in_fence
+            out.append(line)
+            i += 1
+            continue
+
+        if in_fence:
+            out.append(line)
+            i += 1
+            continue
+
+        if strip_h1 and not h1_stripped and H1_RE.match(line):
+            h1_stripped = True
+            i += 1
+            continue
+
+        m = ADMON_START_RE.match(line)
+        if m:
+            macro = ADMON_MACRO[m.group(1)]
+            first = m.group(2).strip()
+
+            paragraphs = []
+            current = [first] if first else []
+            i += 1
+            while i < len(lines):
+                cont = ADMON_CONT_RE.match(lines[i])
+                if not cont:
+                    break
+                content = cont.group(1)
+                if content == "":
+                    if current:
+                        paragraphs.append(" ".join(current))
+                        current = []
+                else:
+                    current.append(content)
+                i += 1
+            if current:
+                paragraphs.append(" ".join(current))
+
+            out.append(f'<ac:structured-macro ac:name="{macro}">')
+            out.append("<ac:rich-text-body>")
+            for p in paragraphs:
+                out.append(f"<p>{p}</p>")
+            out.append("</ac:rich-text-body>")
+            out.append("</ac:structured-macro>")
+            continue
+
+        out.append(line)
+        i += 1
+
+    result = "\n".join(out)
+    if text.endswith("\n"):
+        result += "\n"
+    return result
+
+
+def cmd_mark(args):
+    ensure_deps("mark")
+
+    text = args.input.read_text()
+    body = convert_to_mark(text, strip_h1=args.strip_h1)
+
+    output = args.out_file or args.input.with_suffix(".mark.md")
+    title = args.title or args.input.stem
+
+    header_lines = [f"<!-- Space: {args.space} -->"]
+    for p in (args.parent or []):
+        header_lines.append(f"<!-- Parent: {p} -->")
+    header_lines.append(f"<!-- Title: {title} -->")
+    header_lines.append("")
+
+    output.write_text("\n".join(header_lines) + "\n" + body)
+
+    print(f"Wrote: {output}")
+    print(f"  Space:   {args.space}")
+    if args.parent:
+        print(f"  Parents: {', '.join(args.parent)}")
+    print(f"  Title:   {title}")
+    if args.strip_h1:
+        print("  Stripped leading H1")
+
+
+# ---------- pdf ----------
+
+def cmd_pdf(args):
+    ensure_deps("pdf")
+
+    theme = THEMES[args.theme]
+    overrides_html, width_value = make_overrides_html(args.theme, args.width)
+
+    output = args.out_file or args.input.with_suffix(".pdf")
+    title = args.input.stem
+
+    with tempfile.NamedTemporaryFile("w", suffix=".html", delete=False) as f:
+        f.write(overrides_html)
+        overrides_path = f.name
+    with tempfile.NamedTemporaryFile("w", suffix=".html", delete=False) as f:
+        html_intermediate = f.name
+
+    pandoc_args = [
+        "pandoc", str(args.input), "-o", html_intermediate,
+        "--standalone", "--embed-resources",
+        "--css", theme["css_url"],
+        "-H", overrides_path,
+        "--metadata", f"pagetitle={title}",
+    ]
+    if args.number_sections:
+        pandoc_args.append("--number-sections")
+
+    # PDF-specific CSS: the html theme is sized for desktop browsers
+    # (body up to ~75rem wide). Letter/A4 pages are much narrower, so without
+    # overrides weasyprint clips. Reduce body width, set page margins, and
+    # shrink <pre> so wide ASCII charts/code blocks fit on the page.
+    pdf_css = """
+        @page { size: letter; margin: 0.5in; }
+        body { max-width: 100% !important; }
+        pre, pre code { font-size: 0.70em !important; white-space: pre !important; }
+    """
+    if args.printable:
+        # Force white backgrounds on body, code blocks, and blockquotes so
+        # printed copies don't waste ink on theme-tinted regions.
+        pdf_css += """
+            body, pre, code, pre code, blockquote {
+                background: #fff !important;
+            }
+        """
+
+    try:
+        subprocess.run(pandoc_args, check=True)
+        from weasyprint import HTML, CSS  # checked above by ensure_deps
+        HTML(filename=html_intermediate).write_pdf(
+            str(output),
+            stylesheets=[CSS(string=pdf_css)],
+        )
+    finally:
+        Path(overrides_path).unlink(missing_ok=True)
+        Path(html_intermediate).unlink(missing_ok=True)
+
+    print(f"Wrote: {output} (theme={args.theme}, width={args.width} -> {width_value})")
+
+
+# ---------- doctor ----------
+
+def cmd_doctor(args):
+    print("md2 doctor — dependency check\n")
+    any_missing = False
+
+    for sub, deps in DEPS.items():
+        print(f"  {sub}:")
+        if not deps:
+            print("    OK   (no external dependencies)")
+            print()
+            continue
+        for d in deps:
+            ok, version = check_dep(d)
+            if ok:
+                vline = f"  [{version}]" if version else ""
+                print(f"    OK   {d['name']}{vline}")
+            else:
+                print(f"    MISS {d['name']}  -> install: {d['install']}")
+                any_missing = True
+        print()
+
+    if any_missing:
+        print("Some dependencies are missing. Affected subcommands will fail at runtime.")
+        sys.exit(1)
+    print("All dependencies present.")
+
+
+# ---------- CLI ----------
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="md2",
+        description="Convert Markdown to HTML, mark (Confluence), or PDF.",
+    )
+    sub = p.add_subparsers(dest="subcommand", required=True)
+
+    def add_io(sp):
+        sp.add_argument("input", type=Path, help="Input Markdown file.")
+        sp.add_argument("-o", "--out-file", type=Path, default=None,
+                        help="Output file path. Default: <input>.<ext> next to input.")
+
+    def add_theme(sp):
+        sp.add_argument("--theme", choices=list(THEMES.keys()), default="sakura",
+                        help="Visual theme (default: sakura).")
+        sp.add_argument("--width", choices=list(WIDTH_SCALES.keys()), default="M",
+                        help="Body width: S=80%%, M=100%%, L=125%% of theme default. (default: M)")
+        sp.add_argument("-n", "--number-sections", action="store_true",
+                        help="Prepend section numbers to headings.")
+
+    sp_html = sub.add_parser("html", help="Convert to themed self-contained HTML.")
+    add_io(sp_html); add_theme(sp_html)
+    sp_html.set_defaults(func=cmd_html)
+
+    sp_mark = sub.add_parser("mark", help="Convert to Markdown shaped for kovetskiy/mark.")
+    add_io(sp_mark)
+    sp_mark.add_argument("--space", required=True, help="Confluence space key (e.g. ENG).")
+    sp_mark.add_argument("--parent", action="append", default=None,
+                         help="Parent page title (repeatable; top-most first).")
+    sp_mark.add_argument("--title", default=None,
+                         help="Confluence page title. Default: input filename.")
+    sp_mark.add_argument("--strip-h1", action="store_true",
+                         help="Strip a leading '# Heading' from the body.")
+    sp_mark.set_defaults(func=cmd_mark)
+
+    sp_pdf = sub.add_parser("pdf", help="Convert to themed PDF (reuses html themes).")
+    add_io(sp_pdf); add_theme(sp_pdf)
+    sp_pdf.add_argument("--printable", action="store_true",
+                        help="Force white backgrounds on body, code blocks, "
+                             "and blockquotes (saves ink when printing).")
+    sp_pdf.set_defaults(func=cmd_pdf)
+
+    sp_doc = sub.add_parser("doctor", help="Check dependencies for each subcommand.")
+    sp_doc.set_defaults(func=cmd_doctor)
+
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

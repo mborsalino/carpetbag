@@ -51,6 +51,34 @@ def make_overrides_html(theme_name: str, width: str):
     ]
     if theme["color_overrides"]:
         parts.append(theme["color_overrides"])
+    # Print-time overrides. Without these the on-screen max-width
+    # (75.6rem ≈ 1209px) stays wider than a letter page, so browser
+    # printing runs text gutter-to-gutter and splits tables / <pre>
+    # blocks arbitrarily across page boundaries.
+    parts.append("""
+  @media print {
+    @page { size: letter; margin: 0.75in; }
+    body { max-width: 100% !important; padding: 0 !important; margin: 0 auto !important; }
+    table, pre, blockquote, figure, img {
+      page-break-inside: avoid;
+      break-inside: avoid;
+    }
+    tr, td, th {
+      page-break-inside: avoid;
+      break-inside: avoid;
+    }
+    h1, h2, h3, h4, h5, h6 {
+      page-break-after: avoid;
+      break-after: avoid;
+    }
+    p, li { orphans: 3; widows: 3; }
+    body, pre, code, blockquote { background: #fff !important; }
+    pre, pre code {
+      font-size: 0.85em;
+      white-space: pre-wrap !important;
+      word-wrap: break-word;
+    }
+  }""")
     parts.append("</style>")
     return "\n".join(parts), width_value
 

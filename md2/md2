@@ -54,11 +54,22 @@ def make_overrides_html(theme_name: str, width: str):
     # Print-time overrides. Without these the on-screen max-width
     # (75.6rem ≈ 1209px) stays wider than a letter page, so browser
     # printing runs text gutter-to-gutter and splits tables / <pre>
-    # blocks arbitrarily across page boundaries.
+    # blocks arbitrarily across page boundaries. The typography below
+    # targets an "academic book" feel: 10pt body / 9pt code, wider
+    # left/right margins (1.25in) so text width is ~6in → ~65-72 chars
+    # per line (the typographic sweet spot). Headings scale relative
+    # to body via em.
     parts.append("""
   @media print {
-    @page { size: letter; margin: 0.75in; }
-    body { max-width: 100% !important; padding: 0 !important; margin: 0 auto !important; }
+    @page { size: letter; margin: 0.9in 1.25in; }
+    body { max-width: 100% !important; padding: 0 !important; margin: 0 auto !important;
+           font-size: 10pt; line-height: 1.4; }
+    h1 { font-size: 1.6em;  margin: 1.2em 0 0.5em; }
+    h2 { font-size: 1.3em;  margin: 1.0em 0 0.4em; }
+    h3 { font-size: 1.15em; margin: 0.8em 0 0.3em; }
+    h4 { font-size: 1.0em;  margin: 0.7em 0 0.3em; }
+    h5 { font-size: 1.0em;  margin: 0.6em 0 0.25em; }
+    h6 { font-size: 0.95em; margin: 0.6em 0 0.25em; }
     table, pre, blockquote, figure, img {
       page-break-inside: avoid;
       break-inside: avoid;
@@ -74,7 +85,7 @@ def make_overrides_html(theme_name: str, width: str):
     p, li { orphans: 3; widows: 3; }
     body, pre, code, blockquote { background: #fff !important; }
     pre, pre code {
-      font-size: 0.85em;
+      font-size: 9pt;
       white-space: pre-wrap !important;
       word-wrap: break-word;
     }

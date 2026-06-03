@@ -147,6 +147,8 @@ def ensure_deps(subcommand: str):
 
 def cmd_html(args):
     ensure_deps("html")
+    if not args.input.is_file():
+        sys.exit(f"Error: input file not found: {args.input}")
 
     theme = THEMES[args.theme]
     overrides_html, width_value = make_overrides_html(args.theme, args.width)
@@ -154,22 +156,30 @@ def cmd_html(args):
     output = args.out_file or args.input.with_suffix(".html")
     title = args.input.stem
 
+    # Preprocess the markdown to strip GitHub `> [!NOTE]` markers
+    # before pandoc sees the text — see strip_callout_markers().
+    # We pipe the result on stdin and tell pandoc where to resolve
+    # relative resource paths (images, etc.) via --resource-path.
+    md_text = strip_callout_markers(args.input.read_text())
+
     with tempfile.NamedTemporaryFile("w", suffix=".html", delete=False) as f:
         f.write(overrides_html)
         overrides_path = f.name
 
     pandoc_args = [
-        "pandoc", str(args.input), "-o", str(output),
+        "pandoc", "-o", str(output),
+        "-f", "markdown",
         "--standalone", "--embed-resources",
         "--css", theme["css_url"],
         "-H", overrides_path,
         "--metadata", f"pagetitle={title}",
+        "--resource-path", str(args.input.parent.absolute()),
     ]
     if args.number_sections:
         pandoc_args.append("--number-sections")
 
     try:
-        subprocess.run(pandoc_args, check=True)
+        subprocess.run(pandoc_args, input=md_text, text=True, check=True)
     finally:
         Path(overrides_path).unlink(missing_ok=True)
 
@@ -190,6 +200,43 @@ ADMON_START_RE = re.compile(r"^>\s*\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\s*(
 ADMON_CONT_RE = re.compile(r"^>\s?(.*)$")
 FENCE_RE = re.compile(r"^\s*```")
 H1_RE = re.compile(r"^#\s+")
+
+
+def strip_callout_markers(text: str) -> str:
+    """Rewrite GitHub-style `> [!NOTE]` markers as a bold-labeled
+    blockquote paragraph so pandoc 3.1 (which has no native admonition
+    support) doesn't render the literal `[!NOTE]` text in the output.
+
+    `> [!NOTE]` on its own line becomes `> **NOTE**` followed by a
+    blank quoted line so the label is its own paragraph. Anything on
+    the marker line after `]` is kept as additional content. Code
+    fences are skipped untouched.
+    """
+    lines = text.splitlines()
+    out = []
+    in_fence = False
+    for line in lines:
+        if FENCE_RE.match(line):
+            in_fence = not in_fence
+            out.append(line)
+            continue
+        if in_fence:
+            out.append(line)
+            continue
+        m = ADMON_START_RE.match(line)
+        if m:
+            kind = m.group(1)
+            rest = m.group(2).strip()
+            out.append(f"> **{kind}**")
+            out.append(">")
+            if rest:
+                out.append(f"> {rest}")
+            continue
+        out.append(line)
+    result = "\n".join(out)
+    if text.endswith("\n"):
+        result += "\n"
+    return result
 
 
 def convert_to_mark(text: str, strip_h1: bool = False) -> str:
@@ -288,12 +335,17 @@ def cmd_mark(args):
 
 def cmd_pdf(args):
     ensure_deps("pdf")
+    if not args.input.is_file():
+        sys.exit(f"Error: input file not found: {args.input}")
 
     theme = THEMES[args.theme]
     overrides_html, width_value = make_overrides_html(args.theme, args.width)
 
     output = args.out_file or args.input.with_suffix(".pdf")
     title = args.input.stem
+
+    # See cmd_html — strip GitHub callout markers before pandoc.
+    md_text = strip_callout_markers(args.input.read_text())
 
     with tempfile.NamedTemporaryFile("w", suffix=".html", delete=False) as f:
         f.write(overrides_html)
@@ -302,11 +354,13 @@ def cmd_pdf(args):
         html_intermediate = f.name
 
     pandoc_args = [
-        "pandoc", str(args.input), "-o", html_intermediate,
+        "pandoc", "-o", html_intermediate,
+        "-f", "markdown",
         "--standalone", "--embed-resources",
         "--css", theme["css_url"],
         "-H", overrides_path,
         "--metadata", f"pagetitle={title}",
+        "--resource-path", str(args.input.parent.absolute()),
     ]
     if args.number_sections:
         pandoc_args.append("--number-sections")
@@ -330,7 +384,7 @@ def cmd_pdf(args):
         """
 
     try:
-        subprocess.run(pandoc_args, check=True)
+        subprocess.run(pandoc_args, input=md_text, text=True, check=True)
         from weasyprint import HTML, CSS  # checked above by ensure_deps
         HTML(filename=html_intermediate).write_pdf(
             str(output),
